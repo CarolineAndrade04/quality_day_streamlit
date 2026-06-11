@@ -80,6 +80,12 @@ Execute a aplicação:
 streamlit run app.py
 ```
 
+## Observação
+
+A fonte de dados utilizada durante o evento foi removida da versão pública por motivos de privacidade e confidencialidade.
+
+O repositório tem como objetivo demonstrar a arquitetura da aplicação, a interface desenvolvida e as técnicas de visualização de dados utilizadas no projeto.
+
 ---
 
 ## 👩‍💻 Autora
