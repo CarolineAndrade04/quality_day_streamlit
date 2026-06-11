@@ -1,0 +1,1079 @@
+import html
+import io
+import textwrap
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+import streamlit.components.v1 as components
+from streamlit_autorefresh import st_autorefresh
+
+# ---------------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------------
+
+REFRESH_SECONDS = 15
+REFRESH_INTERVAL_MS = REFRESH_SECONDS * 1000
+MIN_N_CORRELATION = 5
+MIN_RESPOSTAS_AREA = 3
+STABLE_DATA_KEY = "df_respostas_estavel"
+BRASIL_ESTREIA = pd.Timestamp("2026-06-13 19:00", tz="America/Sao_Paulo")
+
+SHEET_URL = (
+    "https://docs.google.com/spreadsheets/d/e/2PACX-1vRHh9vOybI6dGNjkR7J3jjCjecPsa6nCJv5mRDcKYQAsYZOX4PKy6HphYfgbtPl0N1NrNq2spLOyX9U/"
+    "pub?gid=1569732848&single=true&output=csv"
+)
+
+COLUMN_ALIASES = {
+    "timestamp": ["Carimbo de data/hora", "Timestamp", "Data e hora", "Horário"],
+    "experiencia_fabrica": [
+        "🏭 Qual é o seu tempo de experiência na fábrica?",
+        "🏭 Qual é o seu tempo de experiência na fábrica",
+        "Tempo de experiência na fábrica",
+        "Tempo de experiência na fábrica/vidro",
+    ],
+    "cafes": [
+        "☕ Quantos cafés você toma por dia?",
+        "☕ Quantos cafés você toma por dia",
+        "Quantos cafés por dia?",
+        "Cafés por dia",
+    ],
+    "confianca": [
+        "⚽ Qual é a sua confiança no Hexa em 2026?",
+        "⚽ Qual é a sua confiança no Hexa em 2026",
+        "Confiança no Hexa 2026 (%)",
+        "Confiança no Hexa 2026",
+    ],
+    "area": [
+        "🏢 Em qual área você atua?",
+        "🏢 Em qual área você atua",
+        "🏢 Qual é a sua área?",
+        "Qual é a sua área?",
+        "Área",
+    ],
+}
+
+CAFE_MAP = {"0": 0, "1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "5+": 5, "6+": 6}
+
+EXPERIENCIA_SCORE = {
+    "Menos de 1 ano": 0.5,
+    "1 a 5 anos": 3.0,
+    "5 a 10 anos": 7.5,
+    "10 a 20 anos": 15.0,
+    "Mais de 20 anos": 25.0,
+}
+
+COLOR_MAP = {
+    "Menos de 1 ano": "#EF4444",
+    "1 a 5 anos": "#F59E0B",
+    "5 a 10 anos": "#22C55E",
+    "10 a 20 anos": "#0EA5E9",
+    "Mais de 20 anos": "#8B5CF6",
+}
+
+ORDEM_EXPERIENCIA = [
+    "Menos de 1 ano",
+    "1 a 5 anos",
+    "5 a 10 anos",
+    "10 a 20 anos",
+    "Mais de 20 anos",
+]
+
+# ---------------------------------------------------------------------------
+# PAGE CONFIG
+# ---------------------------------------------------------------------------
+
+st.set_page_config(page_title="Quality Week 2026", page_icon="📊", layout="wide")
+st_autorefresh(interval=REFRESH_INTERVAL_MS, key="refresh")
+
+# ---------------------------------------------------------------------------
+# DADOS
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=REFRESH_SECONDS)
+def carregar_dados():
+    try:
+        url_fresca = f"{SHEET_URL}&cache_bust={pd.Timestamp.now().timestamp()}"
+        df_raw = pd.read_csv(url_fresca)
+    except Exception as e:
+        st.error(f"Erro ao carregar dados: {e}")
+        return pd.DataFrame(columns=list(COLUMN_ALIASES.keys()))
+
+    df_raw.columns = df_raw.columns.str.strip()
+
+    def achar_coluna(aliases):
+        return next((alias for alias in aliases if alias in df_raw.columns), None)
+
+    mapeado = {campo: achar_coluna(aliases) for campo, aliases in COLUMN_ALIASES.items()}
+    campos_obrigatorios_mapeamento = ["experiencia_fabrica", "cafes", "confianca", "area"]
+    faltantes = [campo for campo in campos_obrigatorios_mapeamento if mapeado.get(campo) is None]
+
+    if faltantes:
+        st.error(f"Colunas não encontradas: {faltantes}")
+        st.write("Colunas encontradas:", list(df_raw.columns))
+        return pd.DataFrame(columns=list(COLUMN_ALIASES.keys()))
+
+    df = pd.DataFrame({campo: df_raw[col] for campo, col in mapeado.items() if col is not None})
+    if "timestamp" not in df.columns:
+        df["timestamp"] = pd.NaT
+
+    df["experiencia_fabrica"] = df["experiencia_fabrica"].astype(str).str.strip()
+    df["area"] = df["area"].astype(str).str.strip()
+
+    cafe_str = df["cafes"].astype(str).str.strip().str.replace(" ", "", regex=False)
+    df["cafes"] = cafe_str.map(CAFE_MAP)
+    invalidos = cafe_str[df["cafes"].isna() & ~cafe_str.isin(["nan", "None", ""])].unique()
+    if len(invalidos):
+        st.warning(f"Valores de café não reconhecidos (tratados como 0): {list(invalidos)}")
+    df["cafes"] = df["cafes"].fillna(0)
+
+    df["confianca"] = pd.to_numeric(df["confianca"], errors="coerce")
+    if not df["confianca"].dropna().empty and df["confianca"].dropna().max() <= 10:
+        df["confianca"] = df["confianca"] * 10
+
+    df = df.replace(["", "nan", "None", "NaN"], pd.NA)
+    antes = len(df)
+    df = df.dropna(subset=["experiencia_fabrica", "confianca", "area"])
+    descartadas = antes - len(df)
+    if descartadas:
+        st.info(f"{descartadas} resposta(s) descartada(s) por campos incompletos.")
+
+    df["experiencia_score"] = df["experiencia_fabrica"].map(EXPERIENCIA_SCORE)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", dayfirst=True)
+
+    if getattr(df["timestamp"].dt, "tz", None) is None:
+        df["timestamp"] = df["timestamp"].dt.tz_localize(
+            "America/Sao_Paulo", nonexistent="shift_forward", ambiguous="NaT"
+        )
+    else:
+        df["timestamp"] = df["timestamp"].dt.tz_convert("America/Sao_Paulo")
+
+    df["dias_ate_estreia"] = (BRASIL_ESTREIA - df["timestamp"]).dt.total_seconds() / 86400
+    df.loc[df["dias_ate_estreia"] < 0, "dias_ate_estreia"] = 0
+    return df
+
+
+def corr_segura(df, x_col, y_col="confianca"):
+    dff = df[[x_col, y_col]].dropna()
+    if len(dff) < MIN_N_CORRELATION or dff[x_col].nunique() <= 1 or dff[y_col].nunique() <= 1:
+        return None
+    return float(dff[x_col].corr(dff[y_col]))
+
+
+@st.cache_data(ttl=REFRESH_SECONDS)
+def calcular_metricas(df_json: str):
+    df = pd.read_json(io.StringIO(df_json))
+    n = len(df)
+
+    media_cafe = df["cafes"].mean() if n else 0.0
+    media_conf = df["confianca"].mean() if n else 0.0
+    corr_cafe = corr_segura(df, "cafes")
+    corr_exp = corr_segura(df, "experiencia_score")
+    corr_estreia = corr_segura(df, "dias_ate_estreia")
+
+    area_rank = (
+        df.groupby("area", dropna=True)
+        .agg(n_area=("confianca", "size"), confianca_media=("confianca", "mean"))
+        .reset_index()
+        .sort_values(["confianca_media", "n_area"], ascending=[False, False])
+    )
+    area_rank_min = area_rank[area_rank["n_area"] >= MIN_RESPOSTAS_AREA].copy()
+
+    exp_profile = (
+        df.groupby("experiencia_fabrica", dropna=True)
+        .agg(n=("confianca", "size"))
+        .reindex(ORDEM_EXPERIENCIA)
+        .reset_index()
+        .fillna({"n": 0})
+    )
+    exp_profile["n"] = exp_profile["n"].astype(int)
+    exp_profile["pct"] = np.where(n > 0, exp_profile["n"] / n * 100, 0)
+
+    idx_max_conf = df["confianca"].idxmax() if n else None
+    ponto_top = df.loc[idx_max_conf] if idx_max_conf is not None else None
+
+    return {
+        "n": n,
+        "media_cafe": media_cafe,
+        "media_conf": media_conf,
+        "corr_cafe": corr_cafe,
+        "corr_exp": corr_exp,
+        "corr_estreia": corr_estreia,
+        "ponto_top": ponto_top.to_dict() if ponto_top is not None else None,
+        "area_rank": area_rank.to_dict(orient="records"),
+        "area_rank_min": area_rank_min.to_dict(orient="records"),
+        "exp_profile": exp_profile.to_dict(orient="records"),
+    }
+
+# ---------------------------------------------------------------------------
+# ANÁLISE
+# ---------------------------------------------------------------------------
+
+def classificar_correlacao(corr):
+    if corr is None or pd.isna(corr):
+        return "Aguardando"
+    if abs(corr) >= .70:
+        return "Forte"
+    if abs(corr) >= .40:
+        return "Moderada"
+    if abs(corr) >= .15:
+        return "Fraca"
+    return "Quase nula"
+
+
+def associacao_area_confianca(df):
+    if "area" not in df.columns or df["area"].nunique() < 2:
+        return None, "Aguardando"
+    media_geral = df["confianca"].mean()
+    ss_total = ((df["confianca"] - media_geral) ** 2).sum()
+    if ss_total == 0:
+        return None, "Aguardando"
+    ss_entre = (
+        df.groupby("area")["confianca"]
+        .apply(lambda x: len(x) * (x.mean() - media_geral) ** 2)
+        .sum()
+    )
+    eta2 = ss_entre / ss_total
+    nivel = "Forte" if eta2 >= .30 else "Moderada" if eta2 >= .14 else "Fraca" if eta2 >= .06 else "Quase nula"
+    return eta2, nivel
+
+
+def interpretar_cafe_hexa(corr, n):
+    if corr is None or pd.isna(corr):
+        faltam = max(0, MIN_N_CORRELATION - n)
+        return f"☕ Aguardando {faltam} resposta(s) para calcular café × Hexa." if faltam > 0 else "☕ Aguardando mais variação nos dados para café × Hexa."
+    if corr > .40:
+        return "☕ Café e Hexa estão andando juntos: mais café, maior confiança média."
+    if corr > .15:
+        return "☕ Existe um sinal positivo leve entre café e confiança."
+    if corr > -.15:
+        return "⚽ Café e Hexa parecem quase independentes neste dataset."
+    return "☕ Mais café apareceu junto de menor confiança. O dado acordou cético."
+
+
+def interpretar_exp_hexa(corr, n):
+    if corr is None or pd.isna(corr):
+        faltam = max(0, MIN_N_CORRELATION - n)
+        return f"🏭 Aguardando {faltam} resposta(s) para calcular experiência × Hexa." if faltam > 0 else "🏭 Aguardando mais variação nos dados para experiência × Hexa."
+    if corr > .40:
+        return "🏭 Mais tempo de casa está associado a maior confiança no Hexa."
+    if corr > .15:
+        return "🏭 Há um sinal positivo leve entre experiência e confiança."
+    if corr > -.15:
+        return "🏭 Tempo de casa e confiança parecem quase independentes."
+    return "🏭 Maior tempo de casa apareceu associado a mais cautela no Hexa."
+
+
+def calcular_contagem_estreia():
+    agora = pd.Timestamp.now(tz="America/Sao_Paulo")
+    delta = BRASIL_ESTREIA - agora
+    segundos = max(0, int(delta.total_seconds()))
+    dias = segundos // 86400
+    horas = (segundos % 86400) // 3600
+    minutos = (segundos % 3600) // 60
+    return dias, horas, minutos
+
+
+def interpretar_estreia_hexa(corr, n):
+    if corr is None or pd.isna(corr):
+        return "Aguardando carimbo de data/hora suficiente para medir a evolução da confiança até a estreia."
+    if corr <= -0.40:
+        return "A confiança tende a subir conforme a estreia se aproxima."
+    if corr <= -0.15:
+        return "Há um sinal leve de aquecimento conforme o jogo se aproxima."
+    if corr < 0.15:
+        return "A confiança está estável em relação à proximidade da estreia."
+    if corr < 0.40:
+        return "Há um sinal leve de cautela conforme a estreia se aproxima."
+    return "A confiança tende a cair conforme a estreia se aproxima."
+
+
+def insight_por_experiencia(df):
+    ranking = df.groupby("experiencia_fabrica")["confianca"].mean().sort_values(ascending=False)
+    if ranking.empty or len(ranking) < 2:
+        return "Aguardando mais respostas para comparar faixas de experiência."
+    maior = html.escape(str(ranking.index[0]))
+    menor = html.escape(str(ranking.index[-1]))
+    return (
+        f"🏭 A faixa <b>{maior}</b> lidera em confiança média ({ranking.iloc[0]:.1f}%), "
+        f"enquanto <b>{menor}</b> aparece mais cautelosa ({ranking.iloc[-1]:.1f}%)."
+    )
+
+# ---------------------------------------------------------------------------
+# UI HELPERS
+# ---------------------------------------------------------------------------
+
+def kpi_card(icon, label, value, note=""):
+    st.markdown(
+        f"""
+        <div class="kpi-card">
+            <div class="kpi-icon">{html.escape(icon)}</div>
+            <div class="kpi-content">
+                <div class="kpi-label">{html.escape(label)}</div>
+                <div class="kpi-value">{value}</div>
+                <div class="kpi-note">{html.escape(note)}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def stat_chip_html(icon, title, value, note):
+    return f"""
+    <div class="stat-chip">
+        <div class="stat-icon">{html.escape(icon)}</div>
+        <div>
+            <div class="stat-title">{html.escape(title)}</div>
+            <div class="stat-line">{value}</div>
+            <div class="stat-note">{html.escape(note)}</div>
+        </div>
+    </div>
+    """
+
+
+def corr_chip_html(icon, title, level, corr, text):
+    corr_txt = f"r = {corr:.2f}" if corr is not None and not pd.isna(corr) else "r = —"
+    return f"""
+    <div style="display:grid;grid-template-columns:64px 1fr;gap:14px;align-items:center;
+                padding:18px 20px;border-radius:22px;background:linear-gradient(135deg, rgba(255,255,255,.98), rgba(248,250,252,.90));
+                border:1px solid rgba(15,23,42,.10);box-sizing:border-box;font-family:Arial,sans-serif;
+                box-shadow:0 12px 28px rgba(15,23,42,.08);">
+        <div style="width:56px;height:56px;border-radius:18px;display:flex;align-items:center;justify-content:center;
+                    background:linear-gradient(135deg, rgba(56,189,248,.22), rgba(249,115,22,.20));font-size:32px;">
+            {html.escape(icon)}
+        </div>
+        <div>
+            <div style="font-size:20px;color:#475569;font-weight:950;">{html.escape(title)}</div>
+            <div style="font-size:36px;color:#0F172A;font-weight:950;line-height:1.05;">
+                <b>{html.escape(level)}</b> <span style="font-size:18px;color:#64748B;font-weight:900;margin-left:6px;">{html.escape(corr_txt)}</span>
+            </div>
+            <div style="font-size:19px;color:#475569;font-weight:850;line-height:1.25;margin-top:7px;">{html.escape(text)}</div>
+        </div>
+    </div>
+    """
+
+
+def gauge_html(valor_pct: float, titulo: str, subtitulo: str) -> str:
+    clamp = max(0.0, min(100.0, float(valor_pct)))
+    if clamp >= 70:
+        cor, status = "#16A34A", "alta confiança"
+    elif clamp >= 40:
+        cor, status = "#D97706", "confiança média"
+    else:
+        cor, status = "#DC2626", "confiança baixa"
+
+    return f"""
+    <div class="gauge-card cool-gauge">
+      <div class="gauge-topline">
+        <div>
+          <div class="gauge-title">{html.escape(titulo)}</div>
+          <div class="gauge-subtitle">{html.escape(subtitulo)}</div>
+        </div>
+        <div class="gauge-badge" style="border-color:{cor}; color:{cor};">{html.escape(status)}</div>
+      </div>
+
+      <div class="gauge-main">
+        <div class="gauge-number" style="text-shadow:0 0 22px rgba(249,115,22,.20);">{clamp:.1f}%</div>
+        <div class="gauge-scale"><span>0</span><span>25</span><span>50</span><span>75</span><span>100</span></div>
+        <div class="gauge-track">
+          <div class="gauge-fill" style="width:{clamp:.1f}%; background:linear-gradient(90deg,#EF4444,#F59E0B,#22C55E);"></div>
+          <div class="gauge-pin" style="left:calc({clamp:.1f}% - 9px); background:{cor}; box-shadow:0 0 14px rgba(15,23,42,.16);"></div>
+        </div>
+        <div class="gauge-caption">Pulso corporativo do Hexa entre todos os respondentes.</div>
+      </div>
+    </div>
+    """
+
+
+def estimar_cafes_ate_estreia(media_cafe: float, participantes: int):
+    dias, horas, minutos = calcular_contagem_estreia()
+    dias_float = dias + horas / 24 + minutos / 1440
+    total = max(0, int(round(float(media_cafe) * int(participantes) * dias_float)))
+    return total, dias, horas
+
+
+def clima_hexa_html(media_cafe: float, participantes: int) -> str:
+    total_cafes, dias, horas = estimar_cafes_ate_estreia(media_cafe, participantes)
+    cafes_txt = f"{total_cafes/1000:.1f} mil".replace(".", ",") if total_cafes >= 1000 else f"{total_cafes:,}".replace(",", ".")
+    cor = "#F97316"
+    return f"""
+    <div class="clima-card timeline-card coffee-count-card" style="border-color:{cor};">
+        <div class="clima-icon coffee-icon" style="box-shadow:0 10px 24px rgba(249,115,22,.18);">☕</div>
+        <div class="clima-content">
+            <div class="clima-title">Clima do Hexa</div>
+            <div class="clima-line coffee-line" style="color:{cor};">{cafes_txt} cafés</div>
+            <div class="clima-note">estimativa coletiva até Brasil × Marrocos</div>
+            <div class="clima-trend">{participantes} respondentes × {media_cafe:.1f} cafés/dia × {dias}d {horas}h</div>
+            <div class="clima-small">Até 13/06 às 19h, a torcida ainda vai abastecer bem a máquina. Hexa movido a cafeína industrial.</div>
+        </div>
+    </div>
+    """
+
+
+def experiencia_cards_html(exp_df):
+    rows = []
+    max_n = max(1, int(exp_df["n"].max()) if not exp_df.empty else 1)
+    total = max(1, int(exp_df["n"].sum()) if not exp_df.empty else 1)
+
+    for _, r in exp_df.iterrows():
+        faixa = str(r["experiencia_fabrica"])
+        n = int(r["n"])
+        pct = float(n / total * 100) if total else 0.0
+        cor = COLOR_MAP.get(faixa, "#F97316")
+        width = max(5, n / max_n * 100) if n else 5
+        rows.append(f"""
+        <div class="exp-row">
+          <div class="exp-head">
+            <span class="exp-dot" style="background:{cor};box-shadow:0 0 10px {cor};"></span>
+            <span class="exp-label">{html.escape(faixa)}</span>
+            <span class="exp-n">{n} pessoas</span>
+          </div>
+          <div class="exp-bar-bg"><div class="exp-bar" style="width:{width:.1f}%;background:{cor};box-shadow:0 0 12px rgba(15,23,42,.10);"></div></div>
+          <div class="exp-foot"><span>{pct:.0f}% dos respondentes</span><span>densidade da amostra</span></div>
+        </div>
+        """)
+
+    return f"""
+    <html>
+    <head>
+      <style>
+        * {{ box-sizing:border-box; }}
+        body {{ margin:0; padding:0 0 22px 0; background:transparent; font-family:Arial, sans-serif; color:#0F172A; overflow:visible; }}
+        .profile-card {{
+            min-height:520px; overflow:visible; padding:18px 20px 30px; border-radius:30px; box-sizing:border-box;
+            background:linear-gradient(135deg, rgba(255,255,255,.98), rgba(248,250,252,.90));
+            border:1px solid rgba(15,23,42,.10);
+            box-shadow:0 18px 42px rgba(15,23,42,.10), inset 0 1px 0 rgba(255,255,255,.80);
+        }}
+        .profile-title {{ font-size:26px; font-weight:950; color:#0F172A; text-align:center; line-height:1.05; }}
+        .profile-subtitle {{ font-size:15px; font-weight:850; color:#64748B; text-align:center; margin:5px 0 13px; }}
+        .exp-row {{ padding:10px 0 11px; border-bottom:1px solid rgba(15,23,42,.08); }}
+        .exp-row:last-child {{ border-bottom:0; }}
+        .exp-head {{ display:flex; align-items:center; gap:10px; }}
+        .exp-dot {{ width:11px; height:11px; border-radius:50%; flex:0 0 auto; }}
+        .exp-label {{ font-size:18px; font-weight:950; color:#0F172A; flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+        .exp-n {{ font-size:17px; font-weight:950; color:#334155; white-space:nowrap; }}
+        .exp-bar-bg {{ height:10px; background:rgba(15,23,42,.08); border-radius:999px; overflow:hidden; margin-top:8px; }}
+        .exp-bar {{ height:100%; border-radius:999px; }}
+        .exp-foot {{ display:flex; justify-content:space-between; font-size:14px; font-weight:850; color:#64748B; margin-top:6px; }}
+      </style>
+    </head>
+    <body>
+      <div class="profile-card">
+        <div class="profile-title">👥 Composição da amostra</div>
+        <div class="profile-subtitle">Quantidade de pessoas por tempo de casa</div>
+        {''.join(rows)}
+      </div>
+    </body>
+    </html>
+    """
+
+# ---------------------------------------------------------------------------
+# GRÁFICOS
+# ---------------------------------------------------------------------------
+
+def quebra_label(texto, largura=22):
+    partes = textwrap.wrap(str(texto), width=largura)
+    return "<br>".join(partes[:3]) if partes else str(texto)
+
+
+def fig_barras_area(area_df):
+    if area_df.empty:
+        return None
+
+    dff = area_df.copy().sort_values("confianca_media", ascending=True)
+    dff["area_plot"] = dff["area"].astype(str).apply(lambda x: quebra_label(x, 24))
+    dff["texto"] = [f"{v:.1f}%   n={n}" for v, n in zip(dff["confianca_media"], dff["n_area"])]
+    height = max(370, min(620, 68 * len(dff) + 125))
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=dff["confianca_media"],
+        y=dff["area_plot"],
+        orientation="h",
+        text=dff["texto"],
+        textposition="outside",
+        textfont=dict(size=24, color="#0F172A"),
+        cliponaxis=False,
+        marker=dict(
+            color=dff["confianca_media"],
+            colorscale=[[0, "#EF4444"], [.5, "#F59E0B"], [1, "#22C55E"]],
+            cmin=0,
+            cmax=100,
+            line=dict(color="rgba(15,23,42,.16)", width=1.5),
+        ),
+        customdata=np.stack([dff["area"], dff["n_area"]], axis=-1),
+        hovertemplate="<b>%{customdata[0]}</b><br>Confiança média: %{x:.1f}%<br>Respostas: %{customdata[1]}<extra></extra>",
+    ))
+    fig.update_layout(
+        height=height,
+        margin=dict(l=18, r=150, t=18, b=32),
+        xaxis=dict(range=[0, 110], ticksuffix="%", showgrid=True, gridcolor="rgba(15,23,42,.08)", zeroline=False, title=""),
+        yaxis=dict(title="", tickfont=dict(size=24, color="#0F172A"), automargin=True),
+        font=dict(color="#0F172A", size=21),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(255,255,255,.76)",
+        showlegend=False,
+    )
+    return fig
+
+
+def fig_scatter_cafe(df, ponto_top=None, cor_top="#F97316"):
+    fig = go.Figure()
+    fig.add_hrect(
+        y0=70, y1=100, fillcolor="rgba(34,197,94,.16)", opacity=1, line_width=0,
+        annotation_text="zona de alta confiança ⚽",
+        annotation_position="top left",
+        annotation_font=dict(size=20, color="#15803D"),
+    )
+    for y_grid in [0, 25, 50, 75, 100]:
+        fig.add_hline(y=y_grid, line_color="rgba(15,23,42,.08)", line_width=1)
+
+    df_valid = df[["cafes", "confianca"]].dropna()
+    if len(df_valid) >= 3 and df_valid["cafes"].nunique() > 1:
+        x_vals = df_valid["cafes"].values.astype(float)
+        y_vals = df_valid["confianca"].values.astype(float)
+        m, b = np.polyfit(x_vals, y_vals, 1)
+        x_line = np.linspace(x_vals.min(), x_vals.max(), 50)
+        fig.add_trace(go.Scatter(
+            x=x_line, y=m * x_line + b, mode="lines", name="tendência café",
+            line=dict(color="rgba(249,115,22,.75)", width=3, dash="dot"),
+            hoverinfo="skip",
+        ))
+
+    for faixa in ORDEM_EXPERIENCIA:
+        dff = df[df["experiencia_fabrica"] == faixa]
+        if dff.empty:
+            continue
+        cor = COLOR_MAP.get(faixa, "#F97316")
+        fig.add_trace(go.Scatter(
+            x=dff["cafes"], y=dff["confianca"], mode="markers", name=faixa,
+            marker=dict(size=19, color=cor, opacity=0.88, line=dict(width=1.8, color="white")),
+            hovertemplate="<b>%{fullData.name}</b><br>Cafés/dia: %{x}<br>Confiança: %{y:.0f}%<extra></extra>",
+        ))
+
+    if ponto_top is not None:
+        fig.add_trace(go.Scatter(
+            x=[ponto_top["cafes"]], y=[min(114, ponto_top["confianca"] + 8)],
+            mode="text", text=["🏆"], textfont=dict(size=38),
+            showlegend=False, hoverinfo="skip", cliponaxis=False,
+        ))
+        fig.add_annotation(
+            x=ponto_top["cafes"], y=ponto_top["confianca"],
+            text=(
+                f"<b>mais confiante</b><br>{ponto_top['experiencia_fabrica']}<br>"
+                f"{int(ponto_top['cafes'])} cafés/dia • {int(ponto_top['confianca'])}%"
+            ),
+            showarrow=True, arrowhead=2, arrowcolor=cor_top,
+            ax=55, ay=70, bordercolor=cor_top, borderwidth=2.5, borderpad=12,
+            bgcolor="rgba(255,255,255,.98)", font=dict(size=18, color="#0F172A"), align="left",
+        )
+
+    max_cafe = int(df["cafes"].max() if len(df) and pd.notna(df["cafes"].max()) else 0)
+    x_max = max(0.5, min(6, max_cafe) + 0.6)
+    tick_max = min(6, max_cafe)
+
+    fig.update_layout(
+        height=650,
+        margin=dict(l=12, r=28, t=70, b=28),
+        font=dict(color="#0F172A", size=16),
+        legend=dict(
+            orientation="h", yanchor="top", y=1.18, xanchor="center", x=.5,
+            font=dict(size=17, color="#0F172A"), bgcolor="rgba(255,255,255,0)", title_text="",
+        ),
+        xaxis=dict(
+            title="Cafés por dia", title_font=dict(size=20, color="#475569"),
+            tickfont=dict(size=18, color="#475569"), showgrid=False, zeroline=False,
+            linecolor="rgba(15,23,42,.22)", showline=True,
+            range=[-0.5, x_max],
+            tickmode="array",
+            tickvals=list(range(0, tick_max + 1)),
+            ticktext=["5+" if v == 5 else "6+" if v == 6 else str(v) for v in range(0, tick_max + 1)],
+        ),
+        yaxis=dict(
+            title="Confiança no Hexa (%)", title_font=dict(size=20, color="#475569"),
+            tickfont=dict(size=18, color="#475569"), showgrid=False, zeroline=False,
+            linecolor="rgba(15,23,42,.22)", showline=True, range=[-5, 120],
+            tickvals=[0, 25, 50, 75, 100], ticktext=["0%", "25%", "50%", "75%", "100%"],
+        ),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(255,255,255,.82)",
+    )
+    return fig
+
+# ---------------------------------------------------------------------------
+# CSS GLOBAL - FUNDO CLARO
+# ---------------------------------------------------------------------------
+
+st.markdown("""
+<style>
+:root {
+    --bg-0:#FFF7ED;
+    --bg-1:#F8FAFC;
+    --bg-2:#E2E8F0;
+    --card:rgba(255,255,255,.94);
+    --card-2:rgba(248,250,252,.90);
+    --stroke:rgba(15,23,42,.10);
+    --stroke-strong:rgba(249,115,22,.34);
+    --text:#0F172A;
+    --muted:#475569;
+    --muted-2:#64748B;
+    --orange:#F97316;
+    --orange-soft:#EA580C;
+    --blue:#0284C7;
+    --green:#16A34A;
+    --red:#DC2626;
+    --amber:#D97706;
+    --violet:#7C3AED;
+}
+
+.stApp {
+    background:
+        radial-gradient(circle at 7% 8%, rgba(249,115,22,.18), transparent 28%),
+        radial-gradient(circle at 92% 14%, rgba(56,189,248,.12), transparent 24%),
+        radial-gradient(circle at 48% 96%, rgba(167,139,250,.10), transparent 28%),
+        linear-gradient(rgba(15,23,42,.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(15,23,42,.025) 1px, transparent 1px),
+        linear-gradient(135deg, #FFF7ED 0%, #F8FAFC 48%, #E2E8F0 100%);
+    background-size:auto, auto, auto, 36px 36px, 36px 36px, auto;
+    color:var(--text);
+}
+
+[data-testid="stHeader"] {background:transparent;}
+[data-testid="stToolbar"] {right:1rem;}
+.block-container {
+    padding-top:.45rem;
+    padding-bottom:.45rem;
+    padding-left:1.35rem;
+    padding-right:1.35rem;
+    max-width:1520px;
+}
+
+.top-line {
+    height:7px;
+    border-radius:999px;
+    background:linear-gradient(90deg,var(--orange),#FDBA74,var(--blue),var(--violet),var(--orange));
+    margin-bottom:10px;
+    box-shadow:0 8px 24px rgba(249,115,22,.18), 0 10px 30px rgba(2,132,199,.10);
+}
+
+.main-block {
+    position:relative;
+    overflow:hidden;
+    padding:20px 30px;
+    border-radius:30px;
+    background:linear-gradient(135deg, rgba(255,255,255,.98), rgba(248,250,252,.90));
+    border:1px solid var(--stroke);
+    box-shadow:0 18px 42px rgba(15,23,42,.10), inset 0 1px 0 rgba(255,255,255,.80);
+    backdrop-filter:blur(14px);
+}
+.main-block:before {
+    content:"";
+    position:absolute;
+    inset:-80px -60px auto auto;
+    width:220px;
+    height:220px;
+    border-radius:50%;
+    background:radial-gradient(circle, rgba(249,115,22,.20), transparent 66%);
+}
+.eyebrow {
+    color:var(--orange-soft);
+    font-size:18px;
+    font-weight:950;
+    letter-spacing:.10em;
+    text-transform:uppercase;
+}
+.hero-title {
+    font-size:66px;
+    font-weight:950;
+    line-height:.95;
+    color:var(--text);
+    text-shadow:0 8px 20px rgba(15,23,42,.08);
+}
+.hero-thesis {
+    margin-top:12px;
+    font-size:25px;
+    font-weight:850;
+    color:var(--muted);
+}
+.orange {color:var(--orange);}
+
+.kpi-card, .gauge-card, .profile-card, .corr-panel, .insight-box, .clima-card, .stat-chip {
+    border-radius:26px;
+    background:linear-gradient(135deg, rgba(255,255,255,.96), rgba(248,250,252,.88));
+    border:1px solid var(--stroke);
+    box-shadow:0 18px 42px rgba(15,23,42,.10), inset 0 1px 0 rgba(255,255,255,.80);
+    backdrop-filter:blur(14px);
+}
+
+.kpi-card {
+    position:relative;
+    overflow:hidden;
+    padding:13px 16px;
+    border-left:7px solid var(--orange);
+    min-height:112px;
+    display:grid;
+    grid-template-columns:66px 1fr;
+    align-items:center;
+    gap:14px;
+}
+.kpi-card:after {
+    content:"";
+    position:absolute;
+    right:-45px;
+    top:-45px;
+    width:120px;
+    height:120px;
+    border-radius:50%;
+    background:radial-gradient(circle, rgba(56,189,248,.14), transparent 65%);
+}
+.kpi-icon {
+    width:56px;
+    height:56px;
+    border-radius:18px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    background:linear-gradient(135deg, rgba(249,115,22,.22), rgba(56,189,248,.18));
+    box-shadow:0 10px 26px rgba(249,115,22,.14);
+    font-size:32px;
+    line-height:1;
+}
+.kpi-content {display:flex; flex-direction:column; justify-content:center; min-width:0; position:relative; z-index:1;}
+.kpi-label {font-size:18px; color:var(--muted); font-weight:950; line-height:1.05;}
+.kpi-value {font-size:52px; font-weight:950; color:var(--text); line-height:1.0; margin-top:3px;}
+.kpi-note {font-size:16px; color:var(--muted-2); font-weight:850; margin-top:5px;}
+
+.panel-title {
+    font-size:27px;
+    font-weight:950;
+    color:var(--text);
+    margin-top:16px;
+    margin-bottom:0px;
+    text-align:center;
+    line-height:1.05;
+}
+.panel-subtitle {
+    font-size:17px;
+    font-weight:800;
+    color:var(--muted-2);
+    margin-top:2px;
+    margin-bottom:-7px;
+    text-align:center;
+    line-height:1.05;
+}
+
+.gauge-card {height:350px; padding:28px 30px 24px; box-sizing:border-box; font-family:Arial,sans-serif; text-align:left;}
+.cool-gauge {position:relative; overflow:hidden;}
+.cool-gauge:before {
+    content:"";
+    position:absolute;
+    width:260px;
+    height:260px;
+    right:-90px;
+    top:-100px;
+    border-radius:50%;
+    background:radial-gradient(circle, rgba(56,189,248,.16), transparent 68%);
+}
+.gauge-topline {display:flex; justify-content:space-between; gap:20px; align-items:flex-start; position:relative; z-index:1;}
+.gauge-title {font-size:34px; font-weight:950; color:var(--text); line-height:1.0;}
+.gauge-subtitle {font-size:18px; font-weight:850; color:var(--muted-2); margin-top:6px;}
+.gauge-badge {font-size:16px; font-weight:950; padding:8px 13px; border:1px solid; border-radius:999px; background:rgba(255,255,255,.70); white-space:nowrap;}
+.gauge-main {position:relative; z-index:1; margin-top:30px;}
+.gauge-number {font-size:76px; font-weight:950; color:var(--text); line-height:.9; letter-spacing:-.05em;}
+.gauge-scale {display:flex; justify-content:space-between; color:var(--muted-2); font-size:15px; font-weight:900; margin:22px 2px 8px;}
+.gauge-track {position:relative; height:20px; border-radius:999px; background:rgba(15,23,42,.08); overflow:visible; box-shadow:inset 0 1px 0 rgba(15,23,42,.06);}
+.gauge-fill {height:100%; border-radius:999px; box-shadow:0 0 16px rgba(34,197,94,.18);}
+.gauge-pin {position:absolute; top:-5px; width:18px; height:30px; border-radius:999px; border:2px solid rgba(255,255,255,.95);}
+.gauge-caption {font-size:17px; font-weight:850; color:var(--muted); margin-top:18px;}
+
+.clima-card {
+    margin-top:16px;
+    padding:20px 24px;
+    display:grid;
+    grid-template-columns:64px 1fr;
+    gap:16px;
+    align-items:center;
+}
+.clima-icon {
+    width:58px;
+    height:58px;
+    border-radius:20px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-size:33px;
+    background:rgba(249,115,22,.12);
+}
+.clima-title {font-size:20px; font-weight:950; color:var(--muted);}
+.clima-line {font-size:42px; font-weight:950; line-height:1.0; margin-top:2px;}
+.clima-note {font-size:18px; font-weight:850; color:var(--muted-2); margin-top:5px;}
+.clima-trend {font-size:17px; font-weight:900; color:var(--text); margin-top:8px;}
+.clima-small {font-size:15px; font-weight:800; color:var(--muted-2); margin-top:5px; line-height:1.25;}
+.timeline-card {grid-template-columns:64px 1fr;}
+
+.profile-card {padding:16px 18px 22px; font-family:Arial,sans-serif; box-sizing:border-box; overflow:visible;}
+.profile-title {font-size:24px; font-weight:950; color:var(--text); text-align:center;}
+.profile-subtitle {font-size:16px; font-weight:850; color:var(--muted-2); text-align:center; margin-bottom:10px;}
+.exp-row {padding:8px 0 10px; border-bottom:1px solid rgba(15,23,42,.08);}
+.exp-row:last-child {border-bottom:0;}
+.exp-head {display:flex; align-items:center; gap:8px;}
+.exp-dot {width:11px; height:11px; border-radius:50%; flex:0 0 auto;}
+.exp-label {font-size:17px; font-weight:950; color:var(--text); flex:1;}
+.exp-n {font-size:16px; font-weight:900; color:var(--muted);}
+.exp-bar-bg {height:10px; background:rgba(15,23,42,.08); border-radius:999px; overflow:hidden; margin-top:6px;}
+.exp-bar {height:100%; border-radius:999px; box-shadow:0 0 12px rgba(15,23,42,.10);}
+.exp-foot {display:flex; justify-content:space-between; font-size:15px; font-weight:850; color:var(--muted-2); margin-top:5px;}
+
+.stat-grid {
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:16px;
+    margin-top:8px;
+    margin-bottom:30px;
+}
+.stat-chip {
+    display:grid;
+    grid-template-columns:70px 1fr;
+    gap:16px;
+    align-items:center;
+    padding:22px 24px;
+}
+.stat-icon {
+    width:60px;
+    height:60px;
+    border-radius:20px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    background:linear-gradient(135deg, rgba(56,189,248,.20), rgba(249,115,22,.18));
+    font-size:34px;
+}
+.stat-title {font-size:21px; color:var(--muted); font-weight:950;}
+.stat-line {font-size:40px; color:var(--text); font-weight:950; line-height:1.05; margin-top:2px;}
+.stat-note {font-size:19px; color:var(--muted-2); font-weight:850; line-height:1.2; margin-top:6px;}
+
+.dashboard-spacer {height:22px;}
+.coffee-count-card {background:linear-gradient(135deg, rgba(255,255,255,.98), rgba(255,247,237,.92));}
+.coffee-icon {background:linear-gradient(135deg, rgba(249,115,22,.18), rgba(253,186,116,.18));}
+.coffee-line {font-size:42px !important; letter-spacing:-.03em;}
+
+.corr-panel {padding:14px 16px; display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:6px;}
+.corr-chip {
+    display:grid;
+    grid-template-columns:54px 1fr;
+    gap:12px;
+    align-items:center;
+    padding:13px 14px;
+    border-radius:20px;
+    background:rgba(255,255,255,.82);
+    border:1px solid rgba(15,23,42,.08);
+}
+.corr-icon {
+    width:46px;
+    height:46px;
+    border-radius:16px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    background:linear-gradient(135deg, rgba(56,189,248,.20), rgba(249,115,22,.18));
+    font-size:27px;
+}
+.corr-title {font-size:14px; color:var(--muted); font-weight:950;}
+.corr-line {font-size:24px; color:var(--text); font-weight:950; line-height:1.05;}
+.corr-line span {font-size:14px; color:var(--muted-2); font-weight:900; margin-left:5px;}
+.corr-note {font-size:13px; color:var(--muted-2); font-weight:850; line-height:1.18; margin-top:4px;}
+
+.insight-box {
+    padding:18px 24px;
+    color:#9A3412;
+    font-size:20px;
+    font-weight:900;
+    line-height:1.42;
+    border-left:9px solid var(--orange);
+    margin-top:10px;
+    background:linear-gradient(135deg, rgba(255,247,237,.98), rgba(255,255,255,.92));
+}
+.insight-title {font-size:14px; color:var(--orange-soft); font-weight:950; letter-spacing:.07em; text-transform:uppercase; margin-bottom:6px;}
+
+h1,h2,h3 {color:var(--text) !important;}
+div[data-testid="stPlotlyChart"] {margin-top:-4px;}
+.stCaption, caption, .stMarkdown p {color:var(--muted);}
+[data-testid="stImage"] img {filter:drop-shadow(0 12px 22px rgba(15,23,42,.16));}
+</style>
+""", unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
+
+df_atual = carregar_dados()
+
+df_estavel = st.session_state.get(STABLE_DATA_KEY)
+if df_estavel is None or len(df_atual) >= len(df_estavel):
+    st.session_state[STABLE_DATA_KEY] = df_atual.copy()
+    df = df_atual
+else:
+    df = df_estavel.copy()
+    st.caption(
+        f"🛡️ Leitura parcial ignorada: Google retornou {len(df_atual)} linha(s), "
+        f"mantendo {len(df)} resposta(s) estáveis."
+    )
+
+if df.empty:
+    st.warning("Aguardando respostas válidas no formulário...")
+    st.stop()
+
+metricas = calcular_metricas(df.to_json())
+
+participantes = metricas["n"]
+media_cafe = metricas["media_cafe"]
+media_conf = metricas["media_conf"]
+corr_cafe = metricas["corr_cafe"]
+corr_exp = metricas["corr_exp"]
+corr_estreia = metricas["corr_estreia"]
+ponto_top_dict = metricas["ponto_top"]
+area_rank = pd.DataFrame(metricas["area_rank"])
+area_rank_min = pd.DataFrame(metricas["area_rank_min"])
+exp_profile = pd.DataFrame(metricas["exp_profile"])
+
+relacao_cafe = classificar_correlacao(corr_cafe)
+relacao_exp = classificar_correlacao(corr_exp)
+eta_area, relacao_area = associacao_area_confianca(df)
+eta_txt = f"η²={eta_area:.2f}" if eta_area is not None else "η²=—"
+
+ponto_top = pd.Series(ponto_top_dict) if ponto_top_dict else None
+cor_top = COLOR_MAP.get(ponto_top["experiencia_fabrica"], "#F97316") if ponto_top is not None else "#F97316"
+
+# ── Cabeçalho ──────────────────────────────────────────────────────────────
+st.markdown('<div class="top-line"></div>', unsafe_allow_html=True)
+col_logo, col_title, col_qw = st.columns([1.0, 4.7, 1.0])
+
+with col_logo:
+    st.image("logo.jpg", width=160)
+
+with col_title:
+    st.markdown("""
+    <div class="main-block">
+        <div class="eyebrow"> • Quality Week 2026 • Ciência de Dados •</div>
+        <div class="hero-title"><span class="orange">Pensar diferente</span> com dados</div>
+        <div class="hero-thesis">Transformar curiosidade em dados, dados em hipóteses e hipóteses em decisões melhores.</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    components.html(f"""
+    <div style="display:flex;justify-content:center;align-items:center;gap:14px;
+        margin-top:12px;margin-bottom:10px;padding:13px 22px;border-radius:999px;box-sizing:border-box;
+        background:rgba(255,255,255,.92);border:1px solid rgba(249,115,22,.35);
+        color:#9A3412;font-family:Arial,sans-serif;font-size:21px;font-weight:950;
+        width:fit-content;margin-left:auto;margin-right:auto;
+        box-shadow:0 10px 26px rgba(15,23,42,.10);">
+      <span>🟢 Dataset ao vivo</span>
+      <span id="timer">🔄 Atualização em {REFRESH_SECONDS}s</span>
+    </div>
+    <script>
+      let s = {REFRESH_SECONDS};
+      const t = document.getElementById("timer");
+      setInterval(() => {{ s = s > 0 ? s-1 : {REFRESH_SECONDS}; t.innerHTML = "🔄 Atualização em "+s+"s"; }}, 1000);
+    </script>
+    """, height=92)
+
+with col_qw:
+    st.image("logo.qw.jpg", width=190)
+
+# ── KPIs principais ────────────────────────────────────────────────────────
+stats_html = f"""
+<html>
+<head>
+<style>
+* {{ box-sizing:border-box; }}
+body {{ margin:0; padding:0 0 16px 0; background:transparent; font-family:Arial, sans-serif; overflow:visible; }}
+.stat-grid {{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:16px;
+    width:100%;
+}}
+.stat-chip {{
+    display:grid;
+    grid-template-columns:70px 1fr;
+    gap:16px;
+    align-items:center;
+    padding:22px 24px;
+    border-radius:26px;
+    background:linear-gradient(135deg, rgba(255,255,255,.98), rgba(248,250,252,.90));
+    border:1px solid rgba(15,23,42,.10);
+    box-shadow:0 18px 42px rgba(15,23,42,.10), inset 0 1px 0 rgba(255,255,255,.80);
+    min-height:118px;
+    box-sizing:border-box;
+}}
+.stat-icon {{
+    width:60px; height:60px; border-radius:20px;
+    display:flex; align-items:center; justify-content:center;
+    background:linear-gradient(135deg, rgba(56,189,248,.20), rgba(249,115,22,.18));
+    font-size:34px;
+}}
+.stat-title {{font-size:21px; color:#475569; font-weight:950;}}
+.stat-line {{font-size:40px; color:#0F172A; font-weight:950; line-height:1.05; margin-top:2px;}}
+.stat-note {{font-size:19px; color:#64748B; font-weight:850; line-height:1.2; margin-top:6px;}}
+</style>
+</head>
+<body>
+  <div class="stat-grid">
+    {stat_chip_html("👥", "Respondentes", f"{participantes}", "respostas válidas")}
+    {stat_chip_html("☕", "Café médio", f"{media_cafe:.1f}", "xícaras por dia")}
+  </div>
+</body>
+</html>
+"""
+components.html(stats_html, height=176)
+
+# ── Pulso geral + perfil ───────────────────────────────────────────────────
+st.markdown('<div class="dashboard-spacer"></div>', unsafe_allow_html=True)
+p1, p2 = st.columns([1.08, 0.92])
+with p1:
+    st.markdown(gauge_html(media_conf, "Confiança geral", "Pulso médio dos respondentes"), unsafe_allow_html=True)
+    st.markdown(clima_hexa_html(media_cafe, participantes), unsafe_allow_html=True)
+with p2:
+    components.html(experiencia_cards_html(exp_profile), height=610)
+
+# ── Departamento ───────────────────────────────────────────────────────────
+st.markdown('<div class="panel-title">📊 Confiança por departamento</div>', unsafe_allow_html=True)
+st.markdown('<div class="panel-subtitle">Ranking por confiança média, com percentual e número de respostas.</div>', unsafe_allow_html=True)
+fig_area = fig_barras_area(area_rank)
+if fig_area is None:
+    st.info("Aguardando respostas por área.")
+else:
+    st.plotly_chart(fig_area, use_container_width=True)
+
+# ── Relações ───────────────────────────────────────────────────────────────
+corr_html = (
+    '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:18px 20px;border-radius:26px;background:linear-gradient(135deg, rgba(255,255,255,.96), rgba(248,250,252,.88));border:1px solid rgba(15,23,42,.10);box-shadow:0 18px 42px rgba(15,23,42,.10);">'
+    + corr_chip_html("☕", "Café × Hexa", relacao_cafe, corr_cafe, interpretar_cafe_hexa(corr_cafe, participantes))
+    + corr_chip_html("🏭", "Experiência × Hexa", relacao_exp, corr_exp, interpretar_exp_hexa(corr_exp, participantes))
+    + '</div>'
+)
+components.html(corr_html, height=220)
+
+st.markdown('<div class="panel-title">☕ Café, experiência e confiança no Hexa</div>', unsafe_allow_html=True)
+st.markdown('<div class="panel-subtitle">Cada ponto representa um participante. A cor indica o tempo de casa.</div>', unsafe_allow_html=True)
+st.plotly_chart(fig_scatter_cafe(df, ponto_top, cor_top), use_container_width=True)
+
+# ── Insight rodapé ─────────────────────────────────────────────────────────
+insight_final = (
+    f"{insight_por_experiencia(df)}<br>"
+    f"{interpretar_cafe_hexa(corr_cafe, participantes)}<br>"
+    f"{interpretar_exp_hexa(corr_exp, participantes)}<br>"
+    f"☕ Estimativa até a estreia: <b>{estimar_cafes_ate_estreia(media_cafe, participantes)[0]:,}</b> cafés coletivos.".replace(",", ".")
+)
+
+st.markdown(
+    f"""
+    <div class="insight-box">
+      <div class="insight-title">Insight</div>
+      {insight_final}
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
