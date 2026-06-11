@@ -20,10 +20,7 @@ STABLE_DATA_KEY = "df_respostas_estavel"
 BRASIL_ESTREIA = pd.Timestamp("2026-06-13 19:00", tz="America/Sao_Paulo")
 
 
-SHEET_URL = (
-    "https://docs.google.com/spreadsheets/d/e/2PACX-1vRHh9vOybI6dGNjkR7J3jjCjecPsa6nCJv5mRDcKYQAsYZOX4PKy6HphYfgbtPl0N1NrNq2spLOyX9U/"
-    "pub?gid=1569732848&single=true&output=csv"
-)
+SHEET_URL = () # Indique aqui a url do arquivo
 
 COLUMN_ALIASES = {
     "timestamp": [
